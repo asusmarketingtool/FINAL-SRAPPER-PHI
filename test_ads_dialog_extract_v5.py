@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
-# test_ads_dialog_extract_v5.py
+# test_ads_dialog_extract_v6.py
+# Headless + antifingerprint + locale/CL
+# Busca SOLO ads_dialog y escribe al Sheet solicitado.
+# Si no encuentra, deja evidencias en /tmp para depurar.
 # ------------------------------------------------------------
-# Extrae SOLO el POP-UP (ads_dialog) en ASUS y ROG para CL/PE/CO.
-# - 100% headless (sin ventana)
-# - Acepta cookies automáticamente:
-#     * OneTrust (#onetrust-accept-btn-handler)
-#     * Cookiebot (#CybotCookiebotDialogBodyLevelButtonAccept)
-#     * Didomi, TrustArc, Quantcast, genéricos y shadow DOM
-#     * Fallback por texto: "Aceptar todas", "Aceptar", "Accept All", "Accept"
-# - Dispara múltiples triggers para forzar el popup:
-#     * scroll profundo, mouse al borde (exit-intent), mouseout, blur/focus
-# - Busca el popup aunque NO sea visible:
-#     * DOM principal, iframes, y atraviesa shadow DOM
-# - Columnas: timestamp, COUNTRY, WEB, ITEM, HTML_SLOT, GA4 SLOT, ELEMENTS, TEXT, IMAGE, URL
-# - Sobrescribe la hoja del día SOLO si encuentra el popup (no duplica).
-# ------------------------------------------------------------
-
-import os
-import re
-import json
-import time
+import os, re, json, time
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit, urlencode
 
@@ -29,317 +14,241 @@ import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-COUNTRIES = ["CL", "PE", "CO"]
+COUNTRIES = [
+    ("CL", {"lat": -33.45, "lng": -70.66}),
+    ("PE", {"lat": -12.0464, "lng": -77.0428}),
+    ("CO", {"lat":  4.7110, "lng": -74.0721}),
+]
 SITES = ["asus", "rog"]
 
 GOOGLE_SHEET_ID = "1jVd25vYzU6ygqTEwbwYXJtEHD-ya8V4RrRTdNFkLr_A"
 WORKSHEET_TITLE = "EXTRACT_ADS_DIALOG"
 
-HEADERS = [
-    "timestamp", "COUNTRY", "WEB", "ITEM", "HTML_SLOT",
-    "GA4 SLOT", "ELEMENTS", "TEXT", "IMAGE", "URL"
-]
+HEADERS = ["timestamp","COUNTRY","WEB","ITEM","HTML_SLOT","GA4 SLOT","ELEMENTS","TEXT","IMAGE","URL"]
 
 HEADLESS = True
-NAV_TIMEOUT = 60000
-MAX_WAIT_SECONDS = 20  # tiempo total para reintentos por sitio
-POLL_EVERY_MS = 1000   # poll DOM cada 1s
+NAV_TIMEOUT = 70000
+MAX_WAIT_SECONDS = 45
+POLL_EVERY_MS = 1000
 
-
-# =========================
-# Helpers básicos
-# =========================
-def now_ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def ts(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def cache_bust(u: str) -> str:
-    ts = int(time.time() * 1000)
     parts = list(urlsplit(u))
-    q = parts[3]
-    parts[3] = (q + "&" if q else "") + urlencode({"_cb": ts})
+    parts[3] = (parts[3] + "&" if parts[3] else "") + f"_cb={int(time.time()*1000)}"
     return urlunsplit(parts)
 
-
-# =========================
-# Google Sheets
-# =========================
-def get_gspread_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    raw = os.getenv("GCP_SA_JSON", "").strip()
-    if not raw:
-        raise RuntimeError("GCP_SA_JSON está vacío. Define el secret en el repositorio.")
+def gspread_client():
+    raw = os.getenv("GCP_SA_JSON","").strip()
+    if not raw: raise RuntimeError("GCP_SA_JSON vacío.")
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
-        # intento base64 si lo pegaron así por error
         import base64
-        try:
-            decoded = base64.b64decode(raw).decode("utf-8")
-            info = json.loads(decoded)
-        except Exception as e:
-            raise ValueError("Invalid JSON in GCP_SA_JSON") from e
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+        info = json.loads(base64.b64decode(raw).decode("utf-8"))
+    creds = Credentials.from_service_account_info(info, scopes=[
+        "https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"
+    ])
     return gspread.authorize(creds)
 
 def write_rows(rows):
-    gc = get_gspread_client()
+    gc = gspread_client()
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
         ws = sh.worksheet(WORKSHEET_TITLE)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(WORKSHEET_TITLE, rows=100, cols=len(HEADERS))
-    # Sobrescribe
+        ws = sh.add_worksheet(WORKSHEET_TITLE, rows=200, cols=len(HEADERS))
     ws.clear()
     ws.append_row(HEADERS)
     if rows:
         ws.append_rows(rows)
     print(f"✅ Escrito en Sheets: {len(rows)} filas.")
 
-
-# =========================
-# Cookies: aceptación robusta (incluye shadow DOM)
-# =========================
 COOKIE_JS = r"""
 (() => {
-  const texts = ["Aceptar todas", "Aceptar todo", "Aceptar", "Accept All", "Accept", "Agree", "Allow all"];
-  const tryClick = (btn) => {
-    if (!btn) return false;
-    try {
-      const r = btn.getBoundingClientRect();
-      if (r && (r.width === 0 || r.height === 0)) {} // igual intentamos
-      btn.click();
-      return true;
-    } catch (e) { return false; }
-  };
+  const texts = ["Aceptar todas","Aceptar todo","Aceptar","Accept All","Accept","Agree","Allow all"];
+  const click = (el)=>{ try{el.click();return true;}catch(e){return false;} };
+  const q = (s,root=document)=>root.querySelector(s);
 
-  // 1) IDs y selectores comunes (OneTrust, Cookiebot, TrustArc, Quantcast)
-  const candidates = [
+  const selectors = [
     "#onetrust-accept-btn-handler",
     "#onetrust-accept-all-handler",
     "#CybotCookiebotDialogBodyLevelButtonAccept",
     ".osano-cm-accept-all",
     ".truste_button_2",
-    ".qc-cmp2-summary-buttons .qc-cmp2-summary-buttons__button--accept-all",
+    ".qc-cmp2-summary-buttons__button--accept-all",
     "button[aria-label*='aceptar' i]",
     "button[aria-label*='accept' i]",
-    "button[title*='aceptar' i]",
-    "button[title*='accept' i]",
   ];
-  for (const sel of candidates) {
-    const el = document.querySelector(sel);
-    if (el && tryClick(el)) return true;
-  }
+  for (const sel of selectors){ const el=q(sel); if (el && click(el)) return true; }
 
-  // 2) Por texto (en DOM plano)
-  const btns = Array.from(document.querySelectorAll('button, [role="button"], a'));
-  for (const b of btns) {
-    const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-    if (!t) continue;
-    for (const needle of texts) {
-      if (t.includes(needle.toLowerCase())) {
-        if (tryClick(b)) return true;
-      }
+  const tryText = (root=document) => {
+    const nodes=[...root.querySelectorAll('button,[role=button],a')];
+    for (const n of nodes){
+      const t=(n.innerText||n.textContent||"").trim().toLowerCase();
+      if (!t) continue;
+      for (const needle of texts){ if (t.includes(needle.toLowerCase())) { if (click(n)) return true; } }
     }
-  }
-
-  // 3) Shadow DOM: recorre todos los shadow roots buscando botones por texto
-  const getAllShadowButtons = () => {
-    const out = [];
-    const seen = new Set();
-    const walk = (root) => {
-      if (!root || seen.has(root)) return;
-      seen.add(root);
-      const nodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
-      for (const n of nodes) {
-        // botón por tag o role
-        if (
-          n.tagName === "BUTTON" ||
-          n.getAttribute("role") === "button" ||
-          n.tagName === "A"
-        ) {
-          out.push(n);
-        }
-        // si tiene shadowRoot, entrar
-        if (n.shadowRoot) walk(n.shadowRoot);
-      }
-    };
-    walk(document);
-    return out;
+    return false;
   };
+  if (tryText()) return true;
 
-  const sbtns = getAllShadowButtons();
-  for (const b of sbtns) {
-    const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-    if (!t) continue;
-    for (const needle of texts) {
-      if (t.includes(needle.toLowerCase())) {
-        if (tryClick(b)) return true;
-      }
+  // shadow DOM
+  const seen=new Set();
+  const walk=(root)=>{
+    if (!root || seen.has(root)) return false; seen.add(root);
+    const nodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+    for (const n of nodes){
+      if (tryText(n)) return true;
+      if (n.shadowRoot && walk(n.shadowRoot)) return true;
     }
-  }
+    return false;
+  };
+  if (walk(document)) return true;
 
-  // 4) Iframes de consentimiento conocidos
-  const iframes = Array.from(document.querySelectorAll("iframe"));
-  for (const fr of iframes) {
-    try {
+  // iframes
+  for (const fr of document.querySelectorAll("iframe")){
+    try{
       const doc = fr.contentDocument || (fr.contentWindow && fr.contentWindow.document);
       if (!doc) continue;
-      const b2 = Array.from(doc.querySelectorAll("button, [role='button'], a"));
-      for (const b of b2) {
-        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-        for (const needle of texts) {
-          if (t.includes(needle.toLowerCase())) {
-            if (tryClick(b)) return true;
-          }
+      for (const sel of selectors){ const el=doc.querySelector(sel); if (el && click(el)) return true; }
+      if (tryText(doc)) return true;
+      const seen2=new Set();
+      const walk2=(root)=>{
+        if (!root || seen2.has(root)) return false; seen2.add(root);
+        const nodes=root.querySelectorAll?root.querySelectorAll("*"):[];
+        for (const n of nodes){
+          if (tryText(n)) return true;
+          if (n.shadowRoot && walk2(n.shadowRoot)) return true;
         }
-      }
-      const el = doc.querySelector("#onetrust-accept-btn-handler, #onetrust-accept-all-handler, #CybotCookiebotDialogBodyLevelButtonAccept");
-      if (el && tryClick(el)) return true;
-    } catch (e) {}
+        return false;
+      };
+      if (walk2(doc)) return true;
+    }catch(e){}
   }
   return false;
 })();
 """
 
-def accept_cookies(page):
-    try:
-        accepted = page.evaluate(COOKIE_JS)
-        if accepted:
-            print("✅ Cookies aceptadas.")
-        else:
-            print("⚠️ No se encontró banner de cookies (continuando).")
-    except Exception:
-        print("⚠️ Error al intentar aceptar cookies (continuando).")
-
-
-# =========================
-# Triggers de popup
-# =========================
-def fire_triggers(page):
-    try:
-        # scroll profundo y vuelta
-        page.mouse.wheel(0, 1200)
-        page.wait_for_timeout(400)
-        page.mouse.wheel(0, -800)
-        page.wait_for_timeout(400)
-
-        # exit-intent (mouse al borde)
-        page.mouse.move(10, 5)
-        page.wait_for_timeout(200)
-        page.evaluate("""
-            () => {
-              document.dispatchEvent(new MouseEvent('mouseout', {bubbles:true, cancelable:true, relatedTarget:null, clientY:0}));
-            }
-        """)
-        page.wait_for_timeout(300)
-
-        # blur/focus
-        page.evaluate("() => window.dispatchEvent(new Event('blur'))")
-        page.wait_for_timeout(150)
-        page.evaluate("() => window.dispatchEvent(new Event('focus'))")
-        page.wait_for_timeout(350)
-    except Exception:
-        pass
-
-
-# =========================
-# Búsqueda del popup (incluye iframes + shadow DOM)
-# =========================
 FIND_POPUP_JS = r"""
 (() => {
-  // Devuelve un objeto con: title, image, href, found (bool)
-  const ret = {found:false, title:"", image:"", href:""};
-
-  // Función para extraer desde un nodo "banner"
-  const extractFrom = (root, banner) => {
-    const get = (sel, base=banner) => (base && base.querySelector(sel)) || (root && root.querySelector(sel));
-    const pb = get(".PB_body") || banner;
-
-    const titleEl = get(".PB_title", pb);
-    if (titleEl) ret.title = (titleEl.textContent || "").trim();
-
-    const img = get("img", pb);
+  const ret={found:false,title:"",image:"",href:""};
+  const matches = (n)=> n && (n.matches(".PB_promotionBanner.PB_corner.PB_promotionMode") || n.id==="ads_dialog" || (n.id||"").includes("ads_dialog"));
+  const extract = (root, host)=>{
+    const get=(sel,base=host)=> (base && base.querySelector(sel)) || (root && root.querySelector(sel));
+    const pb = get(".PB_body") || host;
+    const t = get(".PB_title", pb);
+    if (t) ret.title = (t.textContent||"").trim();
+    const img = get(".PB_picture img", pb) || get("img", pb);
     if (img) ret.image = img.getAttribute("src") || "";
-
-    const btn = get("a.PB_button", pb);
-    if (btn) ret.href = (btn.getAttribute("href") || "").trim();
-
-    ret.found = !!(ret.title || ret.image || ret.href);
+    const a = get("a.PB_button", pb);
+    if (a) ret.href = (a.getAttribute("href")||"").trim();
+    if (ret.title || ret.image || ret.href) ret.found=true;
   };
 
-  // 1) DOM principal
-  let banner = document.querySelector(".PB_promotionBanner.PB_corner.PB_promotionMode, #ads_dialog, [id*='ads_dialog']");
-  if (banner) { extractFrom(document, banner); if (ret.found) return ret; }
-
-  // 2) Shadow DOM profundo: busca banners
-  const banners = [];
-  const seen = new Set();
-
-  const walk = (root) => {
-    if (!root || seen.has(root)) return;
-    seen.add(root);
-    const nodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
-    for (const n of nodes) {
-      if (n.matches && (n.matches(".PB_promotionBanner.PB_corner.PB_promotionMode") || n.id === "ads_dialog" || (n.id && n.id.includes("ads_dialog")))) {
-        banners.push({root, el:n});
+  const tryRoot = (root) => {
+    let el = root.querySelector(".PB_promotionBanner.PB_corner.PB_promotionMode, #ads_dialog, [id*='ads_dialog']");
+    if (el){ extract(root, el); if (ret.found) return true; }
+    // heurística: encontrar botón PB_button y subir al contenedor
+    const btn = root.querySelector("a.PB_button");
+    if (btn){
+      let n=btn;
+      for (let i=0;i<6 && n;i++){
+        if (matches(n)) { extract(root, n); if (ret.found) return true; }
+        n=n.parentElement;
       }
-      if (n.shadowRoot) walk(n.shadowRoot);
     }
+    return false;
   };
-  walk(document);
 
-  for (const {root, el} of banners) {
-    extractFrom(root, el);
-    if (ret.found) return ret;
-  }
+  if (tryRoot(document)) return ret;
 
-  // 3) iframes
-  const iframes = Array.from(document.querySelectorAll("iframe"));
-  for (const fr of iframes) {
-    try {
-      const doc = fr.contentDocument || (fr.contentWindow && fr.contentWindow.document);
+  // shadow DOM
+  const seen=new Set();
+  const walk=(root)=>{
+    if (!root || seen.has(root)) return false; seen.add(root);
+    if (tryRoot(root)) return true;
+    const nodes=root.querySelectorAll?root.querySelectorAll("*"):[];
+    for (const n of nodes){
+      if (n.shadowRoot && walk(n.shadowRoot)) return true;
+    }
+    return false;
+  };
+  if (walk(document)) return ret;
+
+  // iframes
+  for (const fr of document.querySelectorAll("iframe")){
+    try{
+      const doc=fr.contentDocument || (fr.contentWindow && fr.contentWindow.document);
       if (!doc) continue;
-      const el = doc.querySelector(".PB_promotionBanner.PB_corner.PB_promotionMode, #ads_dialog, [id*='ads_dialog']");
-      if (el) {
-        extractFrom(doc, el);
-        if (ret.found) return ret;
-      }
-      // shadow dentro del iframe
-      const seen2 = new Set();
-      const walk2 = (root) => {
-        if (!root || seen2.has(root)) return;
-        seen2.add(root);
-        const nodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
-        for (const n of nodes) {
-          if (n.matches && (n.matches(".PB_promotionBanner.PB_corner.PB_promotionMode") || n.id === "ads_dialog" || (n.id && n.id.includes("ads_dialog")))) {
-            extractFrom(root, n); if (ret.found) return;
-          }
-          if (n.shadowRoot) walk2(n.shadowRoot);
+      if (tryRoot(doc)) return ret;
+      const seen2=new Set();
+      const walk2=(root)=>{
+        if (!root || seen2.has(root)) return false; seen2.add(root);
+        if (tryRoot(root)) return true;
+        const nodes=root.querySelectorAll?root.querySelectorAll("*"):[];
+        for (const n of nodes){
+          if (n.shadowRoot && walk2(n.shadowRoot)) return true;
         }
+        return false;
       };
-      walk2(doc);
-      if (ret.found) return ret;
-    } catch (e) {}
+      if (walk2(doc)) return ret;
+    }catch(e){}
   }
-
   return ret;
 })();
 """
 
+def accept_cookies(page):
+    try:
+        if page.evaluate(COOKIE_JS): print("✅ Cookies aceptadas.")
+        else: print("⚠️ No se encontró banner de cookies (continuando).")
+    except Exception:
+        print("⚠️ Error aceptando cookies.")
+
+def fire_triggers(page):
+    try:
+        page.mouse.wheel(0, 1500); page.wait_for_timeout(400)
+        page.mouse.wheel(0, -800); page.wait_for_timeout(300)
+        page.mouse.move(10, 3); page.wait_for_timeout(150)
+        page.evaluate("() => document.dispatchEvent(new MouseEvent('mouseout',{bubbles:true,cancelable:true,relatedTarget:null,clientY:0}))")
+        page.wait_for_timeout(250)
+        page.evaluate("() => window.dispatchEvent(new Event('blur'))"); page.wait_for_timeout(120)
+        page.evaluate("() => window.dispatchEvent(new Event('focus'))"); page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+def nav_subpage_roundtrip(page, base_url: str):
+    # Visita /store/ y vuelve, algunos popups disparan al “regresar”
+    try:
+        store = base_url.rstrip("/") + "/store/"
+        page.goto(cache_bust(store), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        page.wait_for_timeout(1200)
+        page.go_back(wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
 def find_popup(page):
     try:
         data = page.evaluate(FIND_POPUP_JS)
-        if data and data.get("found"):
-            return data
+        if data and data.get("found"): return data
     except Exception:
         pass
     return None
 
+def save_evidence(page, tag: str):
+    try:
+        png = f"/tmp/ads_dialog_{tag}.png"
+        html = f"/tmp/ads_dialog_{tag}.html"
+        page.screenshot(path=png, full_page=True)
+        page_content = page.content()
+        with open(html, "w", encoding="utf-8") as f: f.write(page_content)
+        print(f"🧾 Evidencias: {png} | {html}")
+    except Exception as e:
+        print(f"⚠️ No se pudo guardar evidencias ({tag}): {e}")
 
-# =========================
-# Flujo por sitio
-# =========================
-def process_site(context, country: str, site: str):
+def process_site(context, country: str, geo: dict, site: str):
     base = f"https://{'www' if site=='asus' else 'rog'}.asus.com/{country.lower()}/"
     url = cache_bust(base)
     print(f"🌍 [{country}] {site.upper()} → {url}")
@@ -350,77 +259,82 @@ def process_site(context, country: str, site: str):
         print(f"⚠️ Timeout cargando {url}")
     accept_cookies(page)
 
-    # Bucle de reintentos con triggers
-    end = time.time() + MAX_WAIT_SECONDS
+    deadline = time.time() + MAX_WAIT_SECONDS
     found = None
-    iteration = 0
-    while time.time() < end and not found:
-        iteration += 1
+    tries = 0
+
+    while time.time() < deadline and not found:
+        tries += 1
         fire_triggers(page)
-        # pequeña espera y polling
         page.wait_for_timeout(POLL_EVERY_MS)
         found = find_popup(page)
-        # Último intento: hacer scroll a tope y volver
-        if not found and (end - time.time()) < 3:
-            try:
-                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(500)
-                page.evaluate("() => window.scrollTo(0, 0)")
-            except Exception:
-                pass
+        if found: break
+        # mitad del tiempo: hacemos ida/vuelta a /store
+        if tries == 3:
+            nav_subpage_roundtrip(page, base)
+            accept_cookies(page)  # por si reaparece CMP
+
     if found:
         print(f"✅ [{country}-{site}] Popup encontrado.")
-        title = (found.get("title") or "").strip()
-        image = (found.get("image") or "").strip()
-        href = (found.get("href") or "").strip()
         row = [
-            now_ts(),
-            country,
-            site.upper(),
-            "E-SHOP HOME POP UP",
-            "PB_type_lowerRightCorner",
-            "ads_dialog",
-            "1",
-            title,
-            image,
-            href
+            ts(), country, site.upper(),
+            "E-SHOP HOME POP UP", "PB_type_lowerRightCorner",
+            "ads_dialog", "1",
+            (found.get("title") or "").strip(),
+            (found.get("image") or "").strip(),
+            (found.get("href") or "").strip()
         ]
         page.close()
         return row
     else:
-        print(f"❌ [{country}-{site}] No se encontró popup.")
+        print(f"❌ [{country}-{site}] No se encontró popup tras {MAX_WAIT_SECONDS}s.")
+        save_evidence(page, f"{country}_{site}")
         page.close()
         return None
 
-
-# =========================
-# Main
-# =========================
 def run():
-    rows = []
+    rows=[]
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(
-            viewport={"width": 1600, "height": 900},
-            ignore_https_errors=True,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/119.0.0.0 Safari/537.36"
-            ),
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox","--disable-dev-shm-usage",
+                "--disable-gpu","--window-size=1600,900",
+            ]
         )
-        for cc in COUNTRIES:
+        context = browser.new_context(
+            viewport={"width":1600,"height":900},
+            timezone_id="America/Santiago",
+            locale="es-CL",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"),
+            ignore_https_errors=True,
+            extra_http_headers={"Accept-Language":"es-CL,es;q=0.9,en;q=0.8"},
+        )
+        # Quitar bandera webdriver
+        try:
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: ()=> undefined})")
+        except Exception:
+            pass
+
+        for country, geo in COUNTRIES:
+            try:
+                context.grant_permissions(["geolocation"])
+                context.set_geolocation({"latitude": geo["lat"], "longitude": geo["lng"]})
+            except Exception:
+                pass
             for site in SITES:
-                r = process_site(context, cc, site)
-                if r:
-                    rows.append(r)
-        context.close()
-        browser.close()
+                r = process_site(context, country, geo, site)
+                if r: rows.append(r)
+
+        context.close(); browser.close()
 
     if rows:
         write_rows(rows)
     else:
-        print("⚠️ No se obtuvieron datos. (No se escribirá en Sheets)")
+        print("⚠️ No se obtuvieron datos. Revisa evidencias en /tmp para entender por qué.")
 
 if __name__ == "__main__":
     run()
