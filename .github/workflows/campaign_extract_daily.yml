@@ -1,27 +1,25 @@
-name: Campaign Extract Daily (Chile 10:00)
+name: Ads Dialog Extract (Chile 10:00)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # Corre cada hora en UTC; gatea por hora local CL = 10
-  workflow_dispatch: {}    # Manual: siempre corre, sin gate
+    - cron: "0 * * * *"   # corre cada hora; gatea por hora CL = 10
+  workflow_dispatch: {}    # manual: siempre corre
 
 jobs:
-  run-extract:
+  run-ads-dialog:
     runs-on: ubuntu-latest
     env:
       TZ: America/Santiago
 
     steps:
-      - name: Check out repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Gate SOLO aplica si fue invocado por schedule
-      - name: Time gate for schedule only
-        id: timegate
+      - name: Gate for schedule only
+        id: gate
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             HOUR=$(TZ=America/Santiago date +%H)
-            echo "Local hour (America/Santiago): $HOUR"
             if [ "$HOUR" != "10" ]; then
               echo "Not 10:00 in Chile. Skipping."
               echo "run_now=false" >> $GITHUB_OUTPUT
@@ -31,25 +29,21 @@ jobs:
           echo "run_now=true" >> $GITHUB_OUTPUT
 
       - name: Setup Python
-        if: steps.timegate.outputs.run_now == 'true'
+        if: steps.gate.outputs.run_now == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
-        if: steps.timegate.outputs.run_now == 'true'
+      - name: Install deps
+        if: steps.gate.outputs.run_now == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install Playwright (Chromium)
-        if: steps.timegate.outputs.run_now == 'true'
-        run: |
+          pip install playwright gspread google-auth
           python -m playwright install --with-deps chromium
 
-      - name: Run extractor
-        if: steps.timegate.outputs.run_now == 'true'
+      - name: Run popup extractor
+        if: steps.gate.outputs.run_now == 'true'
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
         run: |
-          python campaign_extract_to_sheets.py
+          python test_ads_dialog_extract_v5.py
