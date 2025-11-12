@@ -293,4 +293,135 @@ FIND_POPUP_JS = r"""
     if (ret.found) return ret;
   }
 
-  //
+  // 3) iframes
+  const iframes = Array.from(document.querySelectorAll("iframe"));
+  for (const fr of iframes) {
+    try {
+      const doc = fr.contentDocument || (fr.contentWindow && fr.contentWindow.document);
+      if (!doc) continue;
+      const el = doc.querySelector(".PB_promotionBanner.PB_corner.PB_promotionMode, #ads_dialog, [id*='ads_dialog']");
+      if (el) {
+        extractFrom(doc, el);
+        if (ret.found) return ret;
+      }
+      // shadow dentro del iframe
+      const seen2 = new Set();
+      const walk2 = (root) => {
+        if (!root || seen2.has(root)) return;
+        seen2.add(root);
+        const nodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+        for (const n of nodes) {
+          if (n.matches && (n.matches(".PB_promotionBanner.PB_corner.PB_promotionMode") || n.id === "ads_dialog" || (n.id && n.id.includes("ads_dialog")))) {
+            extractFrom(root, n); if (ret.found) return;
+          }
+          if (n.shadowRoot) walk2(n.shadowRoot);
+        }
+      };
+      walk2(doc);
+      if (ret.found) return ret;
+    } catch (e) {}
+  }
+
+  return ret;
+})();
+"""
+
+def find_popup(page):
+    try:
+        data = page.evaluate(FIND_POPUP_JS)
+        if data and data.get("found"):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+# =========================
+# Flujo por sitio
+# =========================
+def process_site(context, country: str, site: str):
+    base = f"https://{'www' if site=='asus' else 'rog'}.asus.com/{country.lower()}/"
+    url = cache_bust(base)
+    print(f"🌍 [{country}] {site.upper()} → {url}")
+    page = context.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    except PlaywrightTimeout:
+        print(f"⚠️ Timeout cargando {url}")
+    accept_cookies(page)
+
+    # Bucle de reintentos con triggers
+    end = time.time() + MAX_WAIT_SECONDS
+    found = None
+    iteration = 0
+    while time.time() < end and not found:
+        iteration += 1
+        fire_triggers(page)
+        # pequeña espera y polling
+        page.wait_for_timeout(POLL_EVERY_MS)
+        found = find_popup(page)
+        # Último intento: hacer scroll a tope y volver
+        if not found and (end - time.time()) < 3:
+            try:
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(500)
+                page.evaluate("() => window.scrollTo(0, 0)")
+            except Exception:
+                pass
+    if found:
+        print(f"✅ [{country}-{site}] Popup encontrado.")
+        title = (found.get("title") or "").strip()
+        image = (found.get("image") or "").strip()
+        href = (found.get("href") or "").strip()
+        row = [
+            now_ts(),
+            country,
+            site.upper(),
+            "E-SHOP HOME POP UP",
+            "PB_type_lowerRightCorner",
+            "ads_dialog",
+            "1",
+            title,
+            image,
+            href
+        ]
+        page.close()
+        return row
+    else:
+        print(f"❌ [{country}-{site}] No se encontró popup.")
+        page.close()
+        return None
+
+
+# =========================
+# Main
+# =========================
+def run():
+    rows = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context(
+            viewport={"width": 1600, "height": 900},
+            ignore_https_errors=True,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/119.0.0.0 Safari/537.36"
+            ),
+        )
+        for cc in COUNTRIES:
+            for site in SITES:
+                r = process_site(context, cc, site)
+                if r:
+                    rows.append(r)
+        context.close()
+        browser.close()
+
+    if rows:
+        write_rows(rows)
+    else:
+        print("⚠️ No se obtuvieron datos. (No se escribirá en Sheets)")
+
+if __name__ == "__main__":
+    run()
+
