@@ -2,13 +2,8 @@ name: Campaign Extract Daily (Chile 10:00)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # corre cada hora en UTC; gatea por hora local CL = 10
-  workflow_dispatch:
-    inputs:
-      force_now:
-        description: "Forzar ejecución ahora (ignora hora Chile)"
-        required: false
-        default: "false"
+    - cron: "0 * * * *"   # corre cada hora en UTC; el gate deja solo 10:00 CL
+  workflow_dispatch: {}    # manual: siempre corre, sin gate
 
 jobs:
   run-extract:
@@ -19,22 +14,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Time gate (run only at 10:00 CL unless forced)
+      # Gate SOLO para schedule. En manual (workflow_dispatch) se omite.
+      - name: Time gate for schedule only
         id: timegate
         run: |
-          FORCE="${{ github.event.inputs.force_now }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
-            echo "Manual run with force_now=true -> bypass time gate."
-            echo "run_now=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          HOUR=$(TZ=America/Santiago date +%H)
-          echo "Local hour (America/Santiago): $HOUR"
-          if [ "$HOUR" != "10" ]; then
-            echo "Not 10:00 in Chile. Skipping."
-            echo "run_now=false" >> $GITHUB_OUTPUT
-            exit 0
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            HOUR=$(TZ=America/Santiago date +%H)
+            echo "Local hour (America/Santiago): $HOUR"
+            if [ "$HOUR" != "10" ]; then
+              echo "Not 10:00 in Chile. Skipping."
+              echo "run_now=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
           fi
           echo "run_now=true" >> $GITHUB_OUTPUT
 
