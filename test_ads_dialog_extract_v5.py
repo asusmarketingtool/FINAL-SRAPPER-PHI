@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # test_ads_dialog_extract_v6.py
-# Headless + antifingerprint + locale/CL
-# Busca SOLO ads_dialog y escribe al Sheet solicitado.
-# Si no encuentra, deja evidencias en /tmp para depurar.
+# Extrae SOLO el popup ads_dialog (ASUS/ROG) para CL/PE/CO
+# y actualiza EXTRACT_LIM: solo TEXT, IMAGE_URL, URL
+# en la fila del día (DATE=YYYY-MM-DD), COUNTRY y ITEM correctos.
 # ------------------------------------------------------------
+
 import os, re, json, time
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit, urlencode
@@ -14,55 +15,102 @@ import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
+# =========================
+# Config scraping
+# =========================
 COUNTRIES = [
     ("CL", {"lat": -33.45, "lng": -70.66}),
     ("PE", {"lat": -12.0464, "lng": -77.0428}),
-    ("CO", {"lat":  4.7110, "lng": -74.0721}),
+    ("CO", {"lat":   4.7110, "lng": -74.0721}),
 ]
-SITES = ["asus", "rog"]
-
-GOOGLE_SHEET_ID = "1jVd25vYzU6ygqTEwbwYXJtEHD-ya8V4RrRTdNFkLr_A"
-WORKSHEET_TITLE = "EXTRACT_ADS_DIALOG"
-
-HEADERS = ["timestamp","COUNTRY","WEB","ITEM","HTML_SLOT","GA4 SLOT","ELEMENTS","TEXT","IMAGE","URL"]
+SITES = ["asus", "rog"]  # asus.com / rog.asus.com
 
 HEADLESS = True
 NAV_TIMEOUT = 70000
 MAX_WAIT_SECONDS = 45
 POLL_EVERY_MS = 1000
 
-def ts(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# =========================
+# Google Sheets
+# =========================
+GOOGLE_SHEET_ID = "1jVd25vYzU6ygqTEwbwYXJtEHD-ya8V4RrRTdNFkLr_A"
+WORKSHEET_TITLE = "EXTRACT_LIM"  # <- usamos la hoja existente
 
-def cache_bust(u: str) -> str:
-    parts = list(urlsplit(u))
-    parts[3] = (parts[3] + "&" if parts[3] else "") + f"_cb={int(time.time()*1000)}"
-    return urlunsplit(parts)
+def today_date() -> str:
+    # EXTRACT_LIM usa DATE (yyyy-mm-dd), no timestamp
+    return datetime.now().strftime("%Y-%m-%d")
 
 def gspread_client():
     raw = os.getenv("GCP_SA_JSON","").strip()
-    if not raw: raise RuntimeError("GCP_SA_JSON vacío.")
+    if not raw:
+        raise RuntimeError("GCP_SA_JSON vacío. Define el secret en GitHub (JSON completo del SA).")
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
         import base64
         info = json.loads(base64.b64decode(raw).decode("utf-8"))
     creds = Credentials.from_service_account_info(info, scopes=[
-        "https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
     ])
     return gspread.authorize(creds)
 
-def write_rows(rows):
+def load_sheet_and_index():
     gc = gspread_client()
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    try:
-        ws = sh.worksheet(WORKSHEET_TITLE)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(WORKSHEET_TITLE, rows=200, cols=len(HEADERS))
-    ws.clear()
-    ws.append_row(HEADERS)
-    if rows:
-        ws.append_rows(rows)
-    print(f"✅ Escrito en Sheets: {len(rows)} filas.")
+    ws = sh.worksheet(WORKSHEET_TITLE)  # existente
+    values = ws.get_all_values() or []
+    if not values:
+        raise RuntimeError(f"La hoja '{WORKSHEET_TITLE}' está vacía. Debe existir con encabezados.")
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    # Campos obligatorios:
+    need = ["DATE","COUNTRY","ITEM","TEXT","IMAGE_URL","URL"]
+    missing = [c for c in need if c not in idx]
+    if missing:
+        raise RuntimeError(f"Faltan columnas requeridas en '{WORKSHEET_TITLE}': {', '.join(missing)}")
+    return ws, values, header, idx
+
+def batch_update_text_image_url(updates):
+    """
+    updates: lista de dicts con:
+      row_idx (1-indexed), text, image_url, url, col_from, col_to
+    Hace un batch_update por rangos contiguos (TEXT..URL).
+    """
+    if not updates:
+        print("ℹ️ No hay filas para actualizar en Sheets.")
+        return
+    ws, _, header, idx = load_sheet_and_index()
+    reqs = []
+    # armamos los rangos A1 de TEXT..URL para cada fila
+    def col_name(col_idx_1based: int) -> str:
+        name = ""
+        x = col_idx_1based
+        while x:
+            x, rem = divmod(x-1, 26)
+            name = chr(65 + rem) + name
+        return name
+
+    text_col_1 = idx["TEXT"] + 1
+    url_col_1 = idx["URL"] + 1  # incluimos hasta URL
+    for u in updates:
+        r = u["row_idx"]
+        c1 = col_name(text_col_1)
+        c2 = col_name(url_col_1)
+        rng = f"{c1}{r}:{c2}{r}"
+        reqs.append({"range": rng, "values": [[u["text"], u["image_url"], u["url"]]]})
+
+    # batch update
+    ws.batch_update(reqs, value_input_option="USER_ENTERED")
+    print(f"✅ Actualizadas {len(reqs)} fila(s) en '{WORKSHEET_TITLE}' (solo TEXT, IMAGE_URL, URL).")
+
+# =========================
+# Helpers web
+# =========================
+def cache_bust(u: str) -> str:
+    parts = list(urlsplit(u))
+    parts[3] = (parts[3] + "&" if parts[3] else "") + f"_cb={int(time.time()*1000)}"
+    return urlunsplit(parts)
 
 COOKIE_JS = r"""
 (() => {
@@ -118,7 +166,6 @@ COOKIE_JS = r"""
         if (!root || seen2.has(root)) return false; seen2.add(root);
         const nodes=root.querySelectorAll?root.querySelectorAll("*"):[];
         for (const n of nodes){
-          if (tryText(n)) return true;
           if (n.shadowRoot && walk2(n.shadowRoot)) return true;
         }
         return false;
@@ -133,6 +180,7 @@ COOKIE_JS = r"""
 FIND_POPUP_JS = r"""
 (() => {
   const ret={found:false,title:"",image:"",href:""};
+
   const matches = (n)=> n && (n.matches(".PB_promotionBanner.PB_corner.PB_promotionMode") || n.id==="ads_dialog" || (n.id||"").includes("ads_dialog"));
   const extract = (root, host)=>{
     const get=(sel,base=host)=> (base && base.querySelector(sel)) || (root && root.querySelector(sel));
@@ -167,10 +215,10 @@ FIND_POPUP_JS = r"""
   const seen=new Set();
   const walk=(root)=>{
     if (!root || seen.has(root)) return false; seen.add(root);
-    if (tryRoot(root)) return true;
+    if (tryRoot(root)) return ret;
     const nodes=root.querySelectorAll?root.querySelectorAll("*"):[];
     for (const n of nodes){
-      if (n.shadowRoot && walk(n.shadowRoot)) return true;
+      if (n.shadowRoot && walk(n.shadowRoot)) return ret;
     }
     return false;
   };
@@ -201,10 +249,12 @@ FIND_POPUP_JS = r"""
 
 def accept_cookies(page):
     try:
-        if page.evaluate(COOKIE_JS): print("✅ Cookies aceptadas.")
-        else: print("⚠️ No se encontró banner de cookies (continuando).")
+        if page.evaluate(COOKIE_JS):
+            print("✅ Cookies aceptadas.")
+        else:
+            print("⚠️ No se encontró banner de cookies (continuando).")
     except Exception:
-        print("⚠️ Error aceptando cookies.")
+        print("⚠️ Error aceptando cookies (continuando).")
 
 def fire_triggers(page):
     try:
@@ -219,7 +269,6 @@ def fire_triggers(page):
         pass
 
 def nav_subpage_roundtrip(page, base_url: str):
-    # Visita /store/ y vuelve, algunos popups disparan al “regresar”
     try:
         store = base_url.rstrip("/") + "/store/"
         page.goto(cache_bust(store), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
@@ -237,17 +286,9 @@ def find_popup(page):
         pass
     return None
 
-def save_evidence(page, tag: str):
-    try:
-        png = f"/tmp/ads_dialog_{tag}.png"
-        html = f"/tmp/ads_dialog_{tag}.html"
-        page.screenshot(path=png, full_page=True)
-        page_content = page.content()
-        with open(html, "w", encoding="utf-8") as f: f.write(page_content)
-        print(f"🧾 Evidencias: {png} | {html}")
-    except Exception as e:
-        print(f"⚠️ No se pudo guardar evidencias ({tag}): {e}")
-
+# =========================
+# Scrape por sitio
+# =========================
 def process_site(context, country: str, geo: dict, site: str):
     base = f"https://{'www' if site=='asus' else 'rog'}.asus.com/{country.lower()}/"
     url = cache_bust(base)
@@ -269,31 +310,88 @@ def process_site(context, country: str, geo: dict, site: str):
         page.wait_for_timeout(POLL_EVERY_MS)
         found = find_popup(page)
         if found: break
-        # mitad del tiempo: hacemos ida/vuelta a /store
         if tries == 3:
             nav_subpage_roundtrip(page, base)
-            accept_cookies(page)  # por si reaparece CMP
+            accept_cookies(page)
 
     if found:
-        print(f"✅ [{country}-{site}] Popup encontrado.")
-        row = [
-            ts(), country, site.upper(),
-            "E-SHOP HOME POP UP", "PB_type_lowerRightCorner",
-            "ads_dialog", "1",
-            (found.get("title") or "").strip(),
-            (found.get("image") or "").strip(),
-            (found.get("href") or "").strip()
-        ]
+        title = (found.get("title") or "").strip()
+        image = (found.get("image") or "").strip()
+        href = (found.get("href") or "").strip()
         page.close()
-        return row
+        return {
+            "country": country,
+            "site": site,  # 'asus' | 'rog'
+            "title": title,
+            "image": image,
+            "href": href,
+        }
     else:
-        print(f"❌ [{country}-{site}] No se encontró popup tras {MAX_WAIT_SECONDS}s.")
-        save_evidence(page, f"{country}_{site}")
+        print(f"❌ [{country}-{site}] No se encontró popup.")
         page.close()
         return None
 
+# =========================
+# Update selectivo en EXTRACT_LIM
+# =========================
+def make_item_label(site: str) -> str:
+    return "E-SHOP HOME POP UP ASUS.com" if site == "asus" else "E-SHOP HOME POP UP ROG.com"
+
+def update_extract_lim(results):
+    if not results:
+        print("ℹ️ No hay resultados para actualizar en EXTRACT_LIM.")
+        return
+    ws, values, header, idx = load_sheet_and_index()
+    date_today = today_date()
+
+    # Índices 0-based → 1-based para A1
+    text_col = idx["TEXT"] + 1
+    image_col = idx["IMAGE_URL"] + 1
+    url_col = idx["URL"] + 1
+
+    # mapear filas existentes del día por (COUNTRY, ITEM)
+    key_to_row = {}
+    for r_i in range(1, len(values)):  # saltar header
+        row = values[r_i]
+        date_val = row[idx["DATE"]] if idx["DATE"] < len(row) else ""
+        country_val = row[idx["COUNTRY"]] if idx["COUNTRY"] < len(row) else ""
+        item_val = row[idx["ITEM"]] if idx["ITEM"] < len(row) else ""
+        if date_val == date_today and country_val and item_val:
+            key_to_row[(country_val, item_val)] = r_i + 1  # 1-indexed
+
+    # construir updates solo donde exista fila
+    reqs = []
+    def col_name(col_idx_1based: int) -> str:
+        name = ""
+        x = col_idx_1based
+        while x:
+            x, rem = divmod(x-1, 26)
+            name = chr(65 + rem) + name
+        return name
+
+    for res in results:
+        item_label = make_item_label(res["site"])
+        key = (res["country"], item_label)
+        if key not in key_to_row:
+            print(f"⚠️ No existe fila en {WORKSHEET_TITLE} para DATE={date_today}, COUNTRY={res['country']}, ITEM={item_label}. No se actualizará.")
+            continue
+        row_idx = key_to_row[key]
+        c1 = col_name(text_col)
+        c2 = col_name(url_col)  # TEXT..URL (tres columnas contiguas)
+        rng = f"{c1}{row_idx}:{c2}{row_idx}"
+        reqs.append({"range": rng, "values": [[res["title"], res["image"], res["href"]]]})
+
+    if not reqs:
+        print("ℹ️ No hay coincidencias de filas para actualizar hoy.")
+        return
+    ws.batch_update(reqs, value_input_option="USER_ENTERED")
+    print(f"✅ Actualizadas {len(reqs)} fila(s) en '{WORKSHEET_TITLE}' (solo TEXT, IMAGE_URL, URL).")
+
+# =========================
+# Main
+# =========================
 def run():
-    rows=[]
+    results = []
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
@@ -327,14 +425,13 @@ def run():
                 pass
             for site in SITES:
                 r = process_site(context, country, geo, site)
-                if r: rows.append(r)
+                if r:
+                    results.append(r)
 
         context.close(); browser.close()
 
-    if rows:
-        write_rows(rows)
-    else:
-        print("⚠️ No se obtuvieron datos. Revisa evidencias en /tmp para entender por qué.")
+    # Solo actualizar las filas existentes del día
+    update_extract_lim(results)
 
 if __name__ == "__main__":
     run()
