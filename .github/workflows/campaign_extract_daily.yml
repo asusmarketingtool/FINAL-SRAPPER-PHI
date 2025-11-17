@@ -2,8 +2,8 @@ name: Daily Extracts (Campaign + Ads Dialog) Chile 10:00
 
 on:
   schedule:
-    # 10:00 en Chile (UTC-3) → 13:00 UTC
-    - cron: "0 13 * * *"
+    # 09:00 en Chile (UTC-3) → 12:00 UTC
+    - cron: "0 12 * * *"
   workflow_dispatch: {}    # manual: siempre corre
 
 jobs:
