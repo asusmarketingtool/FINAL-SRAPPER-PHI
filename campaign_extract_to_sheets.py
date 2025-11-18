@@ -1,5 +1,8 @@
-# campaign_extract_to_sheets_v2_lim.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # ------------------------------------------------------------
+# campaign_extract_to_sheets.py  (versión robusta con safe_goto)
+#
 # Países: PE/CL/CO (multipaís) → Hoja: EXTRACT_LIM
 # SOLO ITEMS:
 #   E-SHOP HOME POP UP ASUS.com      -> GA4: ads_dialog
@@ -21,6 +24,7 @@
 #   • Reintentos exponenciales en Google Sheets
 #   • Sin timestamp (solo DATE)
 #   • Escritura determinística con resize + batch_update en rangos A1
+#   • Manejo de timeouts en navegación (no revienta el job)
 # ------------------------------------------------------------
 
 import re
@@ -33,7 +37,11 @@ from typing import List, Dict, Optional, Set, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright, Locator
+from playwright.sync_api import (
+    sync_playwright,
+    Locator,
+    TimeoutError as PlaywrightTimeout,
+)
 from urllib.parse import urlsplit, urlunsplit, urlencode
 
 # =========================
@@ -47,10 +55,14 @@ COUNTRY_PATH = "pe"
 # ← ACTUALIZADO (ID nuevo)
 GOOGLE_SHEET_ID = "1jVd25vYzU6ygqTEwbwYXJtEHD-ya8V4RrRTdNFkLr_A"
 WORKSHEET_TITLE = "EXTRACT_LIM"
+
+# En GitHub Actions se usa GCP_SA_JSON; el path local es fallback solo si corres local.
 SERVICE_ACCOUNT_JSON = r"C:\Users\eugenia_neira\OneDrive - ASUS\CODE BUDDY\Python\SITE SCRAPPER\site-scrapper-473615-a2f1587be280.json"
 
 HEADLESS = True
-NAV_TIMEOUT = 45000
+
+# Antes: 45000 → se quedaba corto en /store/. Igual, ahora capturamos timeout.
+NAV_TIMEOUT = 70000  # 70s
 WAIT_MS = 1800
 
 BROWSER_UA = (
@@ -103,18 +115,20 @@ def ga4_slot_for(item: str, position: int) -> str:
 # =========================
 # add_row centralizado (incluye GA4_SLOT)
 # =========================
-def add_row(rows: List[Dict[str, str]],
-            country: str,
-            web: str,
-            item: str,
-            html_slot: str,
-            elements: str,
-            text: str,
-            image_url: str,
-            url: str,
-            position: int,
-            product_name: str = "",
-            product_price: str = ""):
+def add_row(
+    rows: List[Dict[str, str]],
+    country: str,
+    web: str,
+    item: str,
+    html_slot: str,
+    elements: str,
+    text: str,
+    image_url: str,
+    url: str,
+    position: int,
+    product_name: str = "",
+    product_price: str = "",
+):
     ga4_slot = ga4_slot_for(item, position)
     r = {
         "DATE": today_str(),
@@ -146,6 +160,20 @@ def cache_bust(u: str) -> str:
     q = parts[3]
     parts[3] = (q + "&" if q else "") + urlencode({"_cb": ts})
     return urlunsplit(parts)
+
+def safe_goto(page, url: str, label: str) -> bool:
+    """
+    Navega a la URL con cache-buster y captura Timeout.
+    Devuelve True si cargó, False si hubo timeout.
+    """
+    full = cache_bust(url)
+    print(f"[NAV] {COUNTRY} {label} → {full}")
+    try:
+        page.goto(full, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        return True
+    except PlaywrightTimeout:
+        print(f"[TIMEOUT] {COUNTRY} {label} no cargó en {NAV_TIMEOUT}ms: {full}")
+        return False
 
 def absolutize_from_web(web_host: str, url: str) -> str:
     if not url:
@@ -188,7 +216,8 @@ def _extract_onclick_href(s: str) -> str:
     m = re.search(r"(?:location\.href|window\.open)\s*\(\s*['\"]([^'\"]+)['\"]", s)
     if m:
         return m.group(1)
-    m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", s);                     return m.group(1) if m else ""
+    m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", s)
+    return m.group(1) if m else ""
 
 def _sanitize_link(link: str) -> str:
     if not link: return ""
@@ -251,7 +280,8 @@ def _get_img_from_node(page_el, base_url: str) -> str:
             if isinstance(bg, str) and bg and bg.lower() != "none":
                 m = _BG_URL_RE.search(bg)
                 if m:
-                    u = m.group(1);  return u if u.startswith("http") else absolutize_from_web(base_url, u)
+                    u = m.group(1)
+                    return u if u.startswith("http") else absolutize_from_web(base_url, u)
     except Exception:
         pass
     return ""
@@ -261,7 +291,8 @@ def _get_link_from_node(page_el, base_url: str) -> str:
         a = page_el.evaluate_handle("el => el.closest && el.closest('a[href]')")
         href = a.evaluate("el => el ? el.getAttribute('href') : ''")
         if href: return absolutize_from_web(WEB_ASUS, _sanitize_link(href))
-    except Exception: pass
+    except Exception:
+        pass
     try:
         href = page_el.evaluate("""
         (el)=> {
@@ -283,24 +314,28 @@ def _get_link_from_node(page_el, base_url: str) -> str:
             if "location" in href or "window.open" in href:
                 href = _extract_onclick_href(href)
             return absolutize_from_web(WEB_ASUS, _sanitize_link(href))
-    except Exception: pass
+    except Exception:
+        pass
     try:
         href = page_el.evaluate("(el)=>{const a=el.querySelector && el.querySelector('a[href]');return a?a.getAttribute('href'):''}")
         if href: return absolutize_from_web(WEB_ASUS, _sanitize_link(href))
-    except Exception: pass
+    except Exception:
+        pass
     try:
         val = page_el.evaluate("""(el)=> {
-            const btn = el.querySelector && el.querySelector('button[onclick], [role="button"][onclick]');
+            const btn = el.query_selector && el.querySelector('button[onclick], [role="button"][onclick]');
             return btn ? btn.getAttribute('onclick') : '';
         }""")
         if val:
             href = _extract_onclick_href(val)
             if href: return absolutize_from_web(WEB_ASUS, _sanitize_link(href))
-    except Exception: pass
+    except Exception:
+        pass
     try:
         act = page_el.evaluate("(el)=>{const f=el.querySelector && el.querySelector('form[action]');return f?f.getAttribute('action'):''}")
         if act: return absolutize_from_web(WEB_ASUS, _sanitize_link(act))
-    except Exception: pass
+    except Exception:
+        pass
     return ""
 
 def safe_text_from_locator(page, locator) -> str:
@@ -335,7 +370,8 @@ def ensure_visible(page, locator):
         if locator and locator.count() > 0:
             eh = locator.element_handle(timeout=800)
             if eh: page.evaluate("(el)=>el.scrollIntoView({block:'center'})", eh)
-    except Exception: pass
+    except Exception:
+        pass
 
 # =========================
 # HERO base
@@ -346,24 +382,30 @@ SEL_HERO_SLIDES   = ".swiper-slide, .slick-slide, [role='tabpanel'][id*='Slide']
 
 def scrape_hero(page, base_url: str) -> List[Tuple[str,str]]:
     out: List[Tuple[str,str]] = []
-    try: page.wait_for_selector(f"{SEL_HERO_WRAPPERS} {SEL_HERO_SLIDES}, #liBanner, #heroBanner", timeout=12000)
-    except Exception: pass
+    try:
+        page.wait_for_selector(f"{SEL_HERO_WRAPPERS} {SEL_HERO_SLIDES}, #liBanner, #heroBanner", timeout=12000)
+    except Exception:
+        pass
 
     slides = []
     for sel in (f"{SEL_HERO_WRAPPERS} {SEL_HERO_SLIDES}", SEL_HERO_SLIDES):
         try:
             got = page.query_selector_all(sel) or []
             if got: slides = got; break
-        except Exception: continue
+        except Exception:
+            continue
 
     def slide_key(el) -> Tuple[int, str]:
         idx = -1
         try:
             val = el.get_attribute("data-swiper-slide-index")
             if val and val.isdigit(): idx = int(val)
-        except Exception: pass
-        try:    cls = el.get_attribute("class") or ""
-        except Exception: cls = ""
+        except Exception:
+            pass
+        try:
+            cls = el.get_attribute("class") or ""
+        except Exception:
+            cls = ""
         return (idx, cls)
 
     if slides:
@@ -385,11 +427,14 @@ def scrape_hero(page, base_url: str) -> List[Tuple[str,str]]:
         pair = (img or "", link or "")
         if pair not in out and (img or link):
             out.append(pair)
-        if len(out) >= HERO_SLOTS: break
+        if len(out) >= HERO_SLOTS:
+            break
 
     if len(out) < HERO_SLOTS:
-        try: pics = page.query_selector_all("#heroBanner picture, #liBanner picture, picture") or []
-        except Exception: pics = []
+        try:
+            pics = page.query_selector_all("#heroBanner picture, #liBanner picture, picture") or []
+        except Exception:
+            pics = []
         for el in pics:
             img = _get_img_from_node(el, base_url)
             link = _get_link_from_node(el, base_url)
@@ -405,26 +450,31 @@ def scrape_hero(page, base_url: str) -> List[Tuple[str,str]]:
 # =========================
 
 # 1) POPUP ASUS/ROG — SOLO TÍTULO, IMAGEN, URL (NO texto del botón)
-#    Acepta valores por defecto para ASUS (ads_dialog) si el DOM no entrega título/imagen.
-def extract_home_popup(page,
-                       home_url: str,
-                       rows: List[Dict[str, str]],
-                       web_label: str,
-                       default_text: Optional[str] = None,
-                       default_img: Optional[str] = None):
-    page.goto(cache_bust(home_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-    page.wait_for_timeout(3500)
-    popup = page.locator(".PB_promotionBanner.PB_corner.PB_promotionMode").first
+def extract_home_popup(
+    page,
+    home_url: str,
+    rows: List[Dict[str, str]],
+    web_label: str,
+    default_text: Optional[str] = None,
+    default_img: Optional[str] = None,
+):
     html_slot = "PB_type_lowerRightCorner"
     item_lbl = "E-SHOP HOME POP UP ASUS.com" if web_label.startswith("www.asus.com") else "E-SHOP HOME POP UP ROG.com"
+
+    if not safe_goto(page, home_url, f"HOME POPUP {web_label}"):
+        # Si hay timeout, registramos fila y seguimos
+        add_row(rows, COUNTRY, web_label, item_lbl, html_slot, "0", "Timeout cargando página", "", "", 0)
+        return
+
+    page.wait_for_timeout(3500)
+    popup = page.locator(".PB_promotionBanner.PB_corner.PB_promotionMode").first
     if popup.count() == 0 or not popup.is_visible():
-        # Si no está visible, reportamos 0 visibles (comportamiento original)
         add_row(rows, COUNTRY, web_label, item_lbl, html_slot, "0", "No visible", "", "", 0)
         return
 
     body = popup.locator(".PB_body").first
 
-    # Título (sólo PB_title, sin texto del botón)
+    # Título
     title = ""
     if body and body.count() > 0:
         try:
@@ -432,7 +482,7 @@ def extract_home_popup(page,
         except Exception:
             title = ""
 
-    # Imagen (prioriza picture/source -> dlcdn/fwebp -> img/src)
+    # Imagen
     img_src = ""
     pic = body.locator(".PB_picture picture").first if body and body.count() > 0 else popup.locator(".PB_picture picture").first
     if pic and pic.count() > 0:
@@ -450,7 +500,7 @@ def extract_home_popup(page,
         except Exception:
             pass
 
-    # URL del botón (sin incluir el texto del botón)
+    # URL del botón
     href = ""
     try:
         btn = body.locator("a.PB_button").first if body and body.count() > 0 else popup.locator("a.PB_button").first
@@ -460,23 +510,27 @@ def extract_home_popup(page,
     except Exception:
         pass
 
-    # Fallbacks específicos (ads_dialog ASUS) si no hay título o imagen
+    # Fallbacks ASUS
     if web_label.startswith("www.asus.com"):
         if (not title) and default_text:
             title = default_text
         if (not img_src) and default_img:
             img_src = default_img
 
-    # TEXT = sólo título del popup (sin “Regístrate” del botón)
     add_row(rows, COUNTRY, web_label, item_lbl, html_slot, "1", title, img_src, href, 1)
 
 # 2) PROMOTIONAL SLIM BANNER HOME (ASUS)
 def extract_promotional_slim_banner(page, home_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(home_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "PROMOTIONAL SLIM BANNER HOME"
+    if not safe_goto(page, home_url, "PROMOTIONAL SLIM BANNER HOME"):
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, "PromotionBanner__swiperContainer__", "0", "Timeout cargando página", "", "", 0)
+        return
+
     page.wait_for_timeout(WAIT_MS)
     swiper = page.locator("[class^='PromotionBanner__swiperContainer__']").first
     if swiper and swiper.count() > 0:
-        slides = swiper.locator(".swiper-slide"); n = slides.count() or 1
+        slides = swiper.locator(".swiper-slide")
+        n = slides.count() or 1
         for i in range(n):
             slide = slides.nth(i) if slides.count() > 0 else swiper
             link = slide.locator("a").first
@@ -493,18 +547,23 @@ def extract_promotional_slim_banner(page, home_url: str, rows: List[Dict[str, st
                 if img and img.count() > 0:
                     s = img.get_attribute("src") or ""
                     if s: img_src = s if s.startswith("http") else absolutize_from_web(WEB_ASUS, s)
-            add_row(rows, COUNTRY, WEB_ASUS, "PROMOTIONAL SLIM BANNER HOME",
+            add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                     "PromotionBanner__swiperContainer__", str(n), text, img_src, href, i+1)
 
 # 3) HOME HERO (ASUS/ROG)
 def extract_home_hero_all(page, home_url: str, rows: List[Dict[str, str]], web_label: str):
-    page.goto(cache_bust(home_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "HOME BANNER ASUS.com" if web_label.startswith("www.asus.com") else "HOME BANNER ROG.com"
+    if not safe_goto(page, home_url, f"HOME HERO {web_label}"):
+        add_row(rows, COUNTRY, web_label, item_lbl, "#heroBanner", "0", "Timeout cargando página", "", "", 0)
+        return
+
     page.wait_for_timeout(WAIT_MS)
     pairs = scrape_hero(page, home_url)
-    item_lbl = "HOME BANNER ASUS.com" if web_label.startswith("www.asus.com") else "HOME BANNER ROG.com"
-    total = len(pairs); pos = 0
+    total = len(pairs)
+    pos = 0
     for (img, ln) in pairs:
-        if not (img or ln): continue
+        if not (img or ln):
+            continue
         pos += 1
         add_row(rows, COUNTRY, web_label, item_lbl, "#heroBanner", str(total), "", img, ln, pos)
 
@@ -516,10 +575,16 @@ SEL_COLUMN_CARDS = (
 COLUMN_POSITIONS_GA = [1, 2, 3, 4, 5, 6]
 
 def extract_column_banners(page, home_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(home_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "COLUMN BANNER"
+    if not safe_goto(page, home_url, "COLUMN BANNERS"):
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, "ColumnBanner__colBannerCard__", "0", "Timeout cargando página", "", "", 0)
+        return
+
     page.wait_for_timeout(WAIT_MS)
-    try: cards = page.query_selector_all(SEL_COLUMN_CARDS) or []
-    except Exception: cards = []
+    try:
+        cards = page.query_selector_all(SEL_COLUMN_CARDS) or []
+    except Exception:
+        cards = []
     total = min(len(cards), len(COLUMN_POSITIONS_GA))
     for i in range(total):
         card = cards[i]
@@ -527,29 +592,41 @@ def extract_column_banners(page, home_url: str, rows: List[Dict[str, str]]):
         img = _get_img_from_node(target, home_url)
         ln  = _get_link_from_node(card, home_url) or _get_link_from_node(target, home_url)
         if img or ln:
-            add_row(rows, COUNTRY, WEB_ASUS, "COLUMN BANNER",
+            add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                     "ColumnBanner__colBannerCard__", str(total), "", img, ln, i+1)
 
 # 5) BANNER PROMOTIONAL ROG.com
 def extract_rog_promo_banner(page, home_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(home_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "BANNER PROMOTIONAL ROG.com"
+    if not safe_goto(page, home_url, "ROG PROMO BANNER"):
+        # si no carga, simplemente no hay fila (este banner es opcional)
+        return
+
     page.wait_for_timeout(900)
     body = page.locator("[class^='BannerPromotionBar__bannerPromotionBarBody__']").first
-    if not body or body.count()==0 or not body.is_visible(): return
+    if not body or body.count()==0 or not body.is_visible():
+        return
     text = safe_text_from_locator(page, body) or ""
     href = robust_href_from_locator(page, body) or ""
     href = absolutize_from_web(WEB_ROG, href)
-    add_row(rows, COUNTRY, WEB_ROG, "BANNER PROMOTIONAL ROG.com",
+    add_row(rows, COUNTRY, WEB_ROG, item_lbl,
             "BannerPromotionBar__bannerPromotionBarBody__", "1", text, "", href, 1)
 
 # 6) DEALS PAGE TAB (ASUS)
 def extract_deals_tabs(page, deals_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(deals_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "DEALS PAGE TAB"
+    if not safe_goto(page, deals_url, "DEALS PAGE"):
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                ".DealsPage__swiperWrapper__1GwMv > a", "0", "Timeout cargando página", "", "", 0)
+        return
+
     page.wait_for_timeout(WAIT_MS)
-    tabs = page.locator(".DealsPage__swiperWrapper__1GwMv > a"); n = tabs.count()
+    tabs = page.locator(".DealsPage__swiperWrapper__1GwMv > a")
+    n = tabs.count()
     if n == 0:
-        add_row(rows, COUNTRY, WEB_ASUS, "DEALS PAGE TAB",
-                ".DealsPage__swiperWrapper__1GwMv > a", "0", "No se encontraron tabs", "", "", 0); return
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                ".DealsPage__swiperWrapper__1GwMv > a", "0", "No se encontraron tabs", "", "", 0)
+        return
     for i in range(n):
         a = tabs.nth(i)
         href = absolutize_from_web(WEB_ASUS, robust_href_from_locator(page, a))
@@ -559,16 +636,22 @@ def extract_deals_tabs(page, deals_url: str, rows: List[Dict[str, str]]):
         if pic and pic.count() > 0:
             eh = pic.element_handle()
             if eh: img_src = pick_best_image_from_picture_el(eh, deals_url) or ""
-        add_row(rows, COUNTRY, WEB_ASUS, "DEALS PAGE TAB",
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                 ".DealsPage__swiperWrapper__1GwMv", str(n), text, img_src, href, i+1)
 
 # 7) STORE PROMOTION BANNER (ASUS)
 def extract_store_promotion_banner(page, store_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(store_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "STORE PROMOTION BANNER"
+    if not safe_goto(page, store_url, "STORE PROMOTION BANNER"):
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                "StorePromotionBanner__slideContent__", "0", "Timeout cargando página", "", "", 0)
+        return
+
     page.wait_for_timeout(WAIT_MS)
     v1 = page.locator("[class^='StorePromotionBanner__slideContent__']").first
     if v1 and v1.count()>0:
-        slides = page.locator("[class^='StorePromotionBanner__slideContent__']"); n = slides.count()
+        slides = page.locator("[class^='StorePromotionBanner__slideContent__']")
+        n = slides.count()
         for i in range(n):
             s = slides.nth(i)
             link = s.locator("a").first
@@ -584,12 +667,17 @@ def extract_store_promotion_banner(page, store_url: str, rows: List[Dict[str, st
                 if img and img.count()>0:
                     ss = img.get_attribute("src") or ""
                     if ss: img_src = ss if ss.startswith("http") else absolutize_from_web(WEB_ASUS, ss)
-            add_row(rows, COUNTRY, WEB_ASUS, "STORE PROMOTION BANNER",
+            add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                     "StorePromotionBanner__slideContent__", str(n), text, img_src, href, i+1)
 
 # 8) STORE BANNER (store_home_1) — ASUS
 def extract_store_banner_home1(page, store_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(store_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "STORE BANNER"
+    if not safe_goto(page, store_url, "STORE BANNER HOME1"):
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                "store_home_1 (SlimBanner__item__1V1hw)", "0", "Timeout cargando página", "", "", 0)
+        return
+
     page.wait_for_timeout(WAIT_MS)
     first_item = page.locator("a.SlimBanner__item__1V1hw").first
     if first_item and first_item.count()>0:
@@ -604,21 +692,29 @@ def extract_store_banner_home1(page, store_url: str, rows: List[Dict[str, str]])
             if img and img.count()>0:
                 s = img.get_attribute("src") or ""
                 if s: img_src = s if s.startswith("http") else absolutize_from_web(WEB_ASUS, s)
-        add_row(rows, COUNTRY, WEB_ASUS, "STORE BANNER",
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                 "store_home_1 (SlimBanner__item__1V1hw)", "1", "", img_src, href, 1)
     else:
-        add_row(rows, COUNTRY, WEB_ASUS, "STORE BANNER",
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                 "store_home_1 (SlimBanner__item__1V1hw)", "0", "No visible", "", "", 0)
 
 # 9) STORE TABS (ASUS)
 def extract_store_tabs(page, store_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(store_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-    page.wait_for_timeout(WAIT_MS)
-    tabs = page.locator(".AllStore__swiperWrapper__1uYYw > a"); n = tabs.count()
-    if n == 0:
-        add_row(rows, COUNTRY, WEB_ASUS, "STORE TABS",
+    item_lbl = "STORE TABS"
+    if not safe_goto(page, store_url, "STORE TABS"):
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                 "AllStore__sectionWrapper__2n7Ha > .AllStore__swiperWrapper__1uYYw",
-                "0", "No se encontraron tabs", "", "", 0); return
+                "0", "Timeout cargando página", "", "", 0)
+        return
+
+    page.wait_for_timeout(WAIT_MS)
+    tabs = page.locator(".AllStore__swiperWrapper__1uYYw > a")
+    n = tabs.count()
+    if n == 0:
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                "AllStore__sectionWrapper__2n7Ha > .AllStore__swiperWrapper__1uYYw",
+                "0", "No se encontraron tabs", "", "", 0)
+        return
     for i in range(n):
         a = tabs.nth(i)
         href = absolutize_from_web(WEB_ASUS, robust_href_from_locator(page, a))
@@ -635,13 +731,19 @@ def extract_store_tabs(page, store_url: str, rows: List[Dict[str, str]]):
                 s = img.get_attribute("src") or ""
                 if s: img_src = s if s.startswith("http") else absolutize_from_web(WEB_ASUS, s)
         if text and img_src and href:
-            add_row(rows, COUNTRY, WEB_ASUS, "STORE TABS",
+            add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                     "AllStore__sectionWrapper__2n7Ha > .AllStore__swiperWrapper__1uYYw",
                     str(n), text, img_src, href, i+1)
 
 # 10) NEWS AND PROMOTIONS (ASUS Store)
 def extract_news_promotions(page, store_url: str, rows: List[Dict[str, str]]):
-    page.goto(cache_bust(store_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    item_lbl = "NEWS AND PROMOTIONS"
+    if not safe_goto(page, store_url, "NEWS AND PROMOTIONS"):
+        # Aquí estaba ocurriendo tu error. Si hay timeout, ya no se cae.
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                "AllStore__storeNewsWrapper__", "0", "Timeout cargando página", "", "", 0)
+        return
+
     page.wait_for_timeout(WAIT_MS)
     section = page.locator("[class^='AllStore__storeNewsWrapper__']").first
     if section.count()==0:
@@ -649,32 +751,51 @@ def extract_news_promotions(page, store_url: str, rows: List[Dict[str, str]]):
             "xpath=//h2[contains(normalize-space(),'Noticias') or contains(normalize-space(),'Promociones')]/ancestor::div[contains(@class,'AllStore__sectionWrapper__') or contains(@class,'AllStore__storeNewsWrapper__')][1]"
         ).first
     if section.count()==0:
-        add_row(rows, COUNTRY, WEB_ASUS, "NEWS AND PROMOTIONS",
-                "AllStore__storeNewsWrapper__", "0", "Sección no encontrada", "", "", 0); return
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                "AllStore__storeNewsWrapper__", "0", "Sección no encontrada", "", "", 0)
+        return
+
     next_btn = section.locator("[class*='swiper-button-next']").first
-    seen: Set[str] = set(); cards_collected: List[Locator] = []
+    seen: Set[str] = set()
+    cards_collected: List[Locator] = []
+
     def capture_once():
         nonlocal seen, cards_collected
-        cards = section.locator("a[class^='PromotionCard__promotionCard__']"); c = cards.count()
+        cards = section.locator("a[class^='PromotionCard__promotionCard__']")
+        c = cards.count()
         for i in range(c):
             a = cards.nth(i)
             href = robust_href_from_locator(page, a)
-            if not href: continue
+            if not href:
+                continue
             href_abs = absolutize_from_web(WEB_ASUS, href)
-            if href_abs in seen: continue
-            seen.add(href_abs); cards_collected.append(a)
-    capture_once(); turns = 0
+            if href_abs in seen:
+                continue
+            seen.add(href_abs)
+            cards_collected.append(a)
+
+    capture_once()
+    turns = 0
     while next_btn and next_btn.count()>0 and turns < 80:
         try:
-            if next_btn.is_disabled(): break
-        except Exception: pass
+            if next_btn.is_disabled():
+                break
+        except Exception:
+            pass
         try:
-            next_btn.click(timeout=1200); page.wait_for_timeout(420); capture_once(); turns += 1
-        except Exception: break
+            next_btn.click(timeout=1200)
+            page.wait_for_timeout(420)
+            capture_once()
+            turns += 1
+        except Exception:
+            break
+
     total = len(cards_collected)
     if total == 0:
-        add_row(rows, COUNTRY, WEB_ASUS, "NEWS AND PROMOTIONS",
-                "AllStore__storeNewsWrapper__", "0", "Sin tarjetas", "", "", 0); return
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
+                "AllStore__storeNewsWrapper__", "0", "Sin tarjetas", "", "", 0)
+        return
+
     for idx, a in enumerate(cards_collected, start=1):
         href = absolutize_from_web(WEB_ASUS, robust_href_from_locator(page, a))
         img_src = ""
@@ -687,7 +808,7 @@ def extract_news_promotions(page, store_url: str, rows: List[Dict[str, str]]):
             if img and img.count()>0:
                 s = img.get_attribute("src") or ""
                 if s: img_src = s if s.startswith("http") else absolutize_from_web(WEB_ASUS, s)
-        add_row(rows, COUNTRY, WEB_ASUS, "NEWS AND PROMOTIONS",
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                 "AllStore__storeNewsWrapper__", str(total), "", img_src, href, idx)
 
 # =========================
@@ -706,7 +827,6 @@ def get_gspread_client(json_path: str):
         try:
             info = json.loads(sa_env)
         except json.JSONDecodeError:
-            # Intento decodificar como base64 si vino así por error
             import base64
             try:
                 decoded = base64.b64decode(sa_env).decode("utf-8")
@@ -719,18 +839,26 @@ def get_gspread_client(json_path: str):
     return gspread.authorize(creds), creds.service_account_email
 
 def _retry(fn, *args, **kwargs):
-    max_attempts = 6; delay = 1.0; last_err = None
+    max_attempts = 6
+    delay = 1.0
+    last_err = None
     for attempt in range(1, max_attempts+1):
-        try: return fn(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
         except gspread.exceptions.APIError as e:
             msg = str(e)
             if any(code in msg for code in [" 500"," 502"," 503"," 504"]):
                 print(f"[WARN] Sheets API {msg.strip()} — intento {attempt}/{max_attempts}. Esperando {delay:.1f}s…")
-                time.sleep(delay); delay *= 2; last_err = e; continue
+                time.sleep(delay)
+                delay *= 2
+                last_err = e
+                continue
             raise
         except Exception as e:
-            last_err = e; break
-    if last_err: raise last_err
+            last_err = e
+            break
+    if last_err:
+        raise last_err
 
 def _a1(col_idx: int, row_idx: int) -> str:
     # 1-indexed
@@ -755,8 +883,8 @@ def append_or_upsert(sheet_id: str, ws_title: str, rows: List[Dict[str, str]]):
         _retry(ws.update, "A1:"+_a1(len(HEADERS),1), [HEADERS])
         values = [HEADERS]
 
-    # Index de filas existentes (DATE, COUNTRY, ITEM, POSITION) → para updates del mismo día
-    header = values[0]; idx = {h:i for i,h in enumerate(header)}
+    header = values[0]
+    idx = {h:i for i,h in enumerate(header)}
     existing = {}
     for r_i in range(1, len(values)):
         row = values[r_i]
@@ -766,7 +894,8 @@ def append_or_upsert(sheet_id: str, ws_title: str, rows: List[Dict[str, str]]):
             row[idx.get("ITEM",-1)] if "ITEM" in idx and len(row)>idx["ITEM"] else "",
             row[idx.get("POSITION",-1)] if "POSITION" in idx and len(row)>idx["POSITION"] else "",
         )
-        if key[0]: existing[key] = r_i+1  # 1-indexed
+        if key[0]:
+            existing[key] = r_i+1  # 1-indexed
 
     today = today_str()
     to_update_ranges: List[Dict] = []
@@ -782,7 +911,6 @@ def append_or_upsert(sheet_id: str, ws_title: str, rows: List[Dict[str, str]]):
         else:
             to_append_rows.append(row_list)
 
-    # 1) Actualizaciones por lote
     CHUNK = 80
     for i in range(0, len(to_update_ranges), CHUNK):
         chunk = to_update_ranges[i:i+CHUNK]
@@ -790,18 +918,17 @@ def append_or_upsert(sheet_id: str, ws_title: str, rows: List[Dict[str, str]]):
             _retry(ws.batch_update, chunk, value_input_option="USER_ENTERED")
         except Exception as e:
             print(f"[WARN] batch_update falló; guardo en CSV. Motivo: {e}")
-            for u in chunk: to_append_rows.append(u["values"][0])
+            for u in chunk:
+                to_append_rows.append(u["values"][0])
 
-    # 2) Appends determinísticos: calculo fila inicial y escribo por bloques con rangos A1
     if to_append_rows:
         values = values or [HEADERS]
-        last_row = len(values)  # ya incluye header
+        last_row = len(values)
         start = last_row + 1
         need_rows = start + len(to_append_rows) + 10
         if ws.row_count < need_rows:
             _retry(ws.resize, rows=need_rows, cols=max(ws.col_count, len(HEADERS)))
 
-        # escribir en bloques
         for i in range(0, len(to_append_rows), CHUNK):
             block = to_append_rows[i:i+CHUNK]
             r1 = start + i
@@ -816,8 +943,10 @@ def write_fallback_csv(rows: List[Dict[str, str]]):
     try:
         with open(FALLBACK_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=HEADERS)
-            if f.tell() == 0: w.writeheader()
-            for r in rows: w.writerow({h: r.get(h, "") for h in HEADERS})
+            if f.tell() == 0:
+                w.writeheader()
+            for r in rows:
+                w.writerow({h: r.get(h, "") for h in HEADERS})
         print(f"[FALLBACK] Guardado/append CSV local: {FALLBACK_CSV}")
     except Exception as e:
         print(f"[FALLBACK ERROR] {e}")
@@ -828,7 +957,10 @@ def write_fallback_csv(rows: List[Dict[str, str]]):
 def run():
     rows: List[Dict[str, str]] = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--window-size=1600,1000"],
+        )
         context = browser.new_context(
             ignore_https_errors=True,
             viewport={"width": 1600, "height": 1000},
@@ -840,8 +972,10 @@ def run():
 
         for cc in COUNTRIES:
             global COUNTRY, COUNTRY_PATH, WEB_ASUS, WEB_ROG, URLS
-            COUNTRY = cc; COUNTRY_PATH = cc.lower()
-            WEB_ASUS = f"www.asus.com/{COUNTRY_PATH}/"; WEB_ROG = f"rog.asus.com/{COUNTRY_PATH}/"
+            COUNTRY = cc
+            COUNTRY_PATH = cc.lower()
+            WEB_ASUS = f"www.asus.com/{COUNTRY_PATH}/"
+            WEB_ROG  = f"rog.asus.com/{COUNTRY_PATH}/"
             URLS = {
                 "home_asus": f"https://{WEB_ASUS}",
                 "home_rog":  f"https://{WEB_ROG}",
@@ -856,7 +990,7 @@ def run():
                 rows,
                 WEB_ASUS,
                 default_text="MY ASUS Regístrate",
-                default_img="https://dlcdnwebimgs.asus.com/gain/5f77fa18-e244-488e-adff-181cdd651945/fwebp"
+                default_img="https://dlcdnwebimgs.asus.com/gain/5f77fa18-e244-488e-adff-181cdd651945/fwebp",
             )
             extract_promotional_slim_banner(page, URLS["home_asus"], rows)
             extract_home_hero_all(page, URLS["home_asus"], rows, WEB_ASUS)
@@ -876,16 +1010,21 @@ def run():
             extract_store_tabs(page, URLS["store"], rows)
             extract_news_promotions(page, URLS["store"], rows)
 
-        context.close(); browser.close()
+        context.close()
+        browser.close()
 
     try:
         append_or_upsert(GOOGLE_SHEET_ID, WORKSHEET_TITLE, rows)
     except gspread.exceptions.APIError as e:
-        print(f"[ERROR Sheets API] {e}"); write_fallback_csv(rows)
+        print(f"[ERROR Sheets API] {e}")
+        write_fallback_csv(rows)
     except PermissionError:
-        print("[ERROR Permisos] El service account no tiene acceso al Sheet. Compártelo como Editor."); write_fallback_csv(rows)
+        print("[ERROR Permisos] El service account no tiene acceso al Sheet. Compártelo como Editor.")
+        write_fallback_csv(rows)
     except Exception as e:
-        print(f"[ERROR Desconocido] {type(e).__name__}: {e}"); write_fallback_csv(rows)
+        print(f"[ERROR Desconocido] {type(e).__name__}: {e}")
+        write_fallback_csv(rows)
 
 if __name__ == "__main__":
     run()
+
