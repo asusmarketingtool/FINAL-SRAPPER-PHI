@@ -40,5 +40,5 @@ jobs:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
         run: |
           echo "🚀 Iniciando Ads Dialog Extract..."
-          python test_ads_dialog_extract_v5.py
+          python test_ads_dialog_extract_v6.py
           echo "✅ Ads Dialog Extract finalizado."
