@@ -34,7 +34,7 @@ jobs:
           python campaign_extract_to_sheets.py
           echo "✅ Campaign Extract finalizado."
 
-      # 2️⃣ Ads Dialog Extract (actualiza EXTRACT_LIM)
+      # 2️⃣ Ads Dialog Extract
       - name: Run Ads Dialog Extract
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
@@ -43,32 +43,28 @@ jobs:
           python test_ads_dialog_extract_v5.py
           echo "✅ Ads Dialog Extract finalizado."
 
-      # 3️⃣ Notificación por correo (siempre se ejecuta, aunque falle algo arriba)
+      # 3️⃣ Enviar correo SIEMPRE
       - name: Send email notification
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
+          # Usamos valores directos para evitar errores de secretos faltantes
+          server_address: "smtp.office365.com"
+          server_port: "587"
 
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
 
-          # Remitente fijo para evitar el error "from vacío"
           from: "josepedro_montes@asus.com"
-
-          # Destinatario(s)
           to: "josepedro_montes@asus.com"
 
-          # Asunto del correo
           subject: >
             [Daily Extracts] Estado del job: ${{ job.status }}
 
-          # Cuerpo del correo (texto plano)
           body: |
             Hola Chepe,
 
-            El workflow "Daily Extracts (Campaign + Ads Dialog) Chile 10:00" acaba de terminar.
+            El workflow "Daily Extracts (Campaign + Ads Dialog) Chile 10:00" acaba de ejecutarse.
 
             Estado del job: ${{ job.status }}
 
@@ -76,10 +72,9 @@ jobs:
             - Repositorio: ${{ github.repository }}
             - Branch: ${{ github.ref_name }}
             - Run ID: ${{ github.run_id }}
-            - Disparado por: ${{ github.event_name }}
+            - Evento: ${{ github.event_name }}
 
             Link directo al run:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            (Este correo se envía automáticamente desde GitHub Actions.)
-
+            (Correo automático desde GitHub Actions.)
