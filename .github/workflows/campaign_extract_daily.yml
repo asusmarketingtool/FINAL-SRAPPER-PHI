@@ -54,11 +54,11 @@ jobs:
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
 
-          # Remitente: usamos el mismo usuario SMTP
-          from: ${{ secrets.SMTP_USERNAME }}
+          # Remitente fijo para evitar el error "from vacío"
+          from: "josepedro_montes@asus.com"
 
           # Destinatario(s)
-          to: josepedro_montes@asus.com
+          to: "josepedro_montes@asus.com"
 
           # Asunto del correo
           subject: >
@@ -78,7 +78,7 @@ jobs:
             - Run ID: ${{ github.run_id }}
             - Disparado por: ${{ github.event_name }}
 
-            Puedes revisar los logs completos en:
+            Link directo al run:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             (Este correo se envía automáticamente desde GitHub Actions.)
