@@ -34,7 +34,7 @@ jobs:
           python campaign_extract_to_sheets.py
           echo "✅ Campaign Extract finalizado."
 
-      # 2️⃣ Ads Dialog Extract
+      # 2️⃣ Ads Dialog Extract (actualiza EXTRACT_LIM)
       - name: Run Ads Dialog Extract
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
@@ -43,19 +43,21 @@ jobs:
           python test_ads_dialog_extract_v5.py
           echo "✅ Ads Dialog Extract finalizado."
 
-      # 3️⃣ Enviar correo SIEMPRE
-      - name: Send email notification
+      # 3️⃣ Notificación por correo desde asusmarketingtool@gmail.com
+      - name: Send Email Notification
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
-          # Usamos valores directos para evitar errores de secretos faltantes
-          server_address: "smtp.office365.com"
+          # Gmail SMTP
+          server_address: "smtp.gmail.com"
           server_port: "587"
 
+          # Credenciales de la cuenta GMAIL asusmarketingtool@gmail.com
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
 
-          from: "josepedro_montes@asus.com"
+          # Remitente y destinatario
+          from: "asusmarketingtool@gmail.com"
           to: "josepedro_montes@asus.com"
 
           subject: >
@@ -77,4 +79,5 @@ jobs:
             Link directo al run:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            (Correo automático desde GitHub Actions.)
+            (Correo automático enviado desde asusmarketingtool@gmail.com via GitHub Actions.)
+
