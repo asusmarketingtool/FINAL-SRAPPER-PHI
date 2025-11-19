@@ -40,7 +40,7 @@ jobs:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
         run: |
           echo "🚀 Iniciando Ads Dialog Extract..."
-          python test_ads_dialog_extract_v6.py
+          python test_ads_dialog_extract_v5.py
           echo "✅ Ads Dialog Extract finalizado."
 
       # 3️⃣ Notificación por correo (siempre se ejecuta, aunque falle algo arriba)
@@ -54,8 +54,8 @@ jobs:
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
 
-          # Remitente (debe ser un correo válido en tu dominio)
-          from: ${{ secrets.MAIL_FROM }}
+          # Remitente: usamos el mismo usuario SMTP
+          from: ${{ secrets.SMTP_USERNAME }}
 
           # Destinatario(s)
           to: josepedro_montes@asus.com
@@ -82,3 +82,4 @@ jobs:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             (Este correo se envía automáticamente desde GitHub Actions.)
+
