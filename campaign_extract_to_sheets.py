@@ -14,7 +14,7 @@
 #   BANNER PROMOTIONAL ROG.com       -> GA4: index_bar_banner_1
 #   DEALS PAGE TAB                   -> GA4: pending
 #   STORE PROMOTION BANNER           -> GA4: store_bar_banner_1
-#   STORE BANNER                     -> GA4: store_home_1
+#   STORE BANNER                     -> GA4: store_home_hero_banner_1 (desde 2025-01-29)
 #   STORE TABS                       -> GA4: pending
 #   NEWS AND PROMOTIONS              -> GA4: store_home_card_banner_#
 #
@@ -97,6 +97,9 @@ def today_str() -> str:
 # =========================
 # GA4 SLOT mapping
 # =========================
+# Fecha de corte para el cambio de nombre del slot STORE BANNER
+_STORE_BANNER_CUTOFF = datetime(2025, 1, 29).date()
+
 def ga4_slot_for(item: str, position: int) -> str:
     i = (item or "").strip().lower()
     if i == "e-shop home pop up asus.com": return "ads_dialog"
@@ -104,7 +107,9 @@ def ga4_slot_for(item: str, position: int) -> str:
     if i == "banner promotional rog.com":  return "index_bar_banner_1"
     if i == "promotional slim banner home": return "index_bar_banner_1"
     if i == "store promotion banner":      return "store_bar_banner_1"
-    if i == "store banner":                return "store_home_1"
+    if i == "store banner":
+        # Desde el 29-ene-2025 el slot pasó a llamarse store_home_hero_banner_1
+        return "store_home_hero_banner_1" if datetime.now().date() >= _STORE_BANNER_CUTOFF else "store_home_1"
     if i == "store tabs":                  return "pending"
     if i == "home banner asus.com":        return f"hero_banner_{position if position>0 else 1}"
     if i == "home banner rog.com":         return f"hero_banner_{position if position>0 else 1}"
@@ -670,12 +675,12 @@ def extract_store_promotion_banner(page, store_url: str, rows: List[Dict[str, st
             add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                     "StorePromotionBanner__slideContent__", str(n), text, img_src, href, i+1)
 
-# 8) STORE BANNER (store_home_1) — ASUS
+# 8) STORE BANNER (store_home_hero_banner_1 desde 2025-01-29) — ASUS
 def extract_store_banner_home1(page, store_url: str, rows: List[Dict[str, str]]):
     item_lbl = "STORE BANNER"
     if not safe_goto(page, store_url, "STORE BANNER HOME1"):
         add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
-                "store_home_1 (SlimBanner__item__1V1hw)", "0", "Timeout cargando página", "", "", 0)
+                "store_home_hero_banner_1 (SlimBanner__item__1V1hw)", "0", "Timeout cargando página", "", "", 0)
         return
 
     page.wait_for_timeout(WAIT_MS)
@@ -693,10 +698,10 @@ def extract_store_banner_home1(page, store_url: str, rows: List[Dict[str, str]])
                 s = img.get_attribute("src") or ""
                 if s: img_src = s if s.startswith("http") else absolutize_from_web(WEB_ASUS, s)
         add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
-                "store_home_1 (SlimBanner__item__1V1hw)", "1", "", img_src, href, 1)
+                "store_home_hero_banner_1 (SlimBanner__item__1V1hw)", "1", "", img_src, href, 1)
     else:
         add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
-                "store_home_1 (SlimBanner__item__1V1hw)", "0", "No visible", "", "", 0)
+                "store_home_hero_banner_1 (SlimBanner__item__1V1hw)", "0", "No visible", "", "", 0)
 
 # 9) STORE TABS (ASUS)
 def extract_store_tabs(page, store_url: str, rows: List[Dict[str, str]]):
@@ -739,7 +744,6 @@ def extract_store_tabs(page, store_url: str, rows: List[Dict[str, str]]):
 def extract_news_promotions(page, store_url: str, rows: List[Dict[str, str]]):
     item_lbl = "NEWS AND PROMOTIONS"
     if not safe_goto(page, store_url, "NEWS AND PROMOTIONS"):
-        # Aquí estaba ocurriendo tu error. Si hay timeout, ya no se cae.
         add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
                 "AllStore__storeNewsWrapper__", "0", "Timeout cargando página", "", "", 0)
         return
@@ -1027,4 +1031,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
