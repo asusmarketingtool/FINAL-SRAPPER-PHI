@@ -16,6 +16,16 @@
 #
 #   Cambios marcados con:  # === VIDEO BANNER ADDITION ===
 #
+# >>> FIX 2026-08-27: COLUMN BANNER <<<
+#   - El selector dependía del hash de CSS Modules (…__3FBSI), que ASUS
+#     regenera en cada build del front. Ahora se usa [class*='colBannerCard'],
+#     agnóstico al hash.
+#   - Se agrega scroll completo + wait_for_selector (la sección está debajo
+#     del fold y se renderiza lazy).
+#   - Se escribe SIEMPRE una fila cuando no se encuentra nada, para que el
+#     fallo sea visible en el sheet el mismo día en vez de desaparecer.
+#   Cambios marcados con:  # === COLUMN BANNER FIX ===
+#
 # REQUISITO (una sola vez): compartir el spreadsheet del scraper
 #   (1a6B41V05SJsuI2AVf7zneEuguXrRt5q1KoIL6zLZnUY) como LECTOR con el email
 #   del Service Account (se imprime en consola al correr: "[INFO] Service Account: ...").
@@ -549,31 +559,66 @@ def extract_home_hero_all(page, home_url: str, rows: List[Dict[str, str]], web_l
             continue
         pos += 1
         add_row(rows, COUNTRY, web_label, item_lbl, "#heroBanner", str(total), "", img, ln, pos)
+# =========================
 # 4) COLUMN BANNER (ASUS)
+# === COLUMN BANNER FIX (2026-08-27) ===
+# Antes el selector dependía del hash de CSS Modules (…__3FBSI) que ASUS
+# regenera en cada build, y además:
+#   - ".ColumnBanner__colBannerCard__" (sin hash) nunca matcheaba nada,
+#     porque el selector de clase es exacto, no prefijo.
+#   - "[class*='column'] [class*='banner']" es case-sensitive, así que
+#     nunca matcheó "ColumnBanner".
+# Ahora el selector principal es agnóstico al hash y hay flag 'i' donde hace falta.
+# =========================
 SEL_COLUMN_CARDS = (
-    ".ColumnBanner__colBannerCard__, .ColumnBanner__colBannerCard__3FBSI, "
-    "[class*='ColumnBanner'] [class*='colBanner'], [class*='column'] [class*='banner']"
+    "[class*='colBannerCard'], "
+    "[class*='ColumnBanner'] a[class*='Card'], "
+    "[class*='columnbanner' i] [class*='banner' i]"
 )
 COLUMN_POSITIONS_GA = [1, 2, 3, 4, 5, 6]
+
+def _scroll_full(page, steps: int = 10, dy: int = 900):
+    """La sección de column banners está debajo del fold y se renderiza lazy."""
+    for _ in range(steps):
+        try:
+            page.mouse.wheel(0, dy)
+        except Exception:
+            break
+        page.wait_for_timeout(250)
+    page.wait_for_timeout(800)
+
 def extract_column_banners(page, home_url: str, rows: List[Dict[str, str]]):
     item_lbl = "COLUMN BANNER"
+    slot = "ColumnBanner__colBannerCard__"
     if not safe_goto(page, home_url, "COLUMN BANNERS"):
-        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, "ColumnBanner__colBannerCard__", "0", "Timeout cargando página", "", "", 0)
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, "0", "Timeout cargando página", "", "", 0)
         return
     page.wait_for_timeout(WAIT_MS)
+    _scroll_full(page)
+    try:
+        page.wait_for_selector(SEL_COLUMN_CARDS, timeout=8000)
+    except Exception:
+        pass
     try:
         cards = page.query_selector_all(SEL_COLUMN_CARDS) or []
     except Exception:
         cards = []
+    print(f"[COLUMN] {COUNTRY}: {len(cards)} tarjeta(s) encontradas.")
     total = min(len(cards), len(COLUMN_POSITIONS_GA))
+    # Si no hay nada, dejamos constancia en el sheet (antes no se escribía
+    # ninguna fila y el fallo pasaba desapercibido durante días).
+    if total == 0:
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, "0",
+                "No se encontraron column banners (revisar selector)", "", "", 0)
+        return
     for i in range(total):
         card = cards[i]
         target = card.query_selector("picture") or card.query_selector("img") or card
         img = _get_img_from_node(target, home_url)
         ln  = _get_link_from_node(card, home_url) or _get_link_from_node(target, home_url)
         if img or ln:
-            add_row(rows, COUNTRY, WEB_ASUS, item_lbl,
-                    "ColumnBanner__colBannerCard__", str(total), "", img, ln, i+1)
+            add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, str(total), "", img, ln, i+1)
+# === END COLUMN BANNER FIX ===
 # 5) BANNER PROMOTIONAL ROG.com
 def extract_rog_promo_banner(page, home_url: str, rows: List[Dict[str, str]]):
     item_lbl = "BANNER PROMOTIONAL ROG.com"
