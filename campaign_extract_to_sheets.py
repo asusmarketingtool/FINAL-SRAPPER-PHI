@@ -570,11 +570,22 @@ def extract_home_hero_all(page, home_url: str, rows: List[Dict[str, str]], web_l
 #     nunca matcheó "ColumnBanner".
 # Ahora el selector principal es agnóstico al hash y hay flag 'i' donde hace falta.
 # =========================
-SEL_COLUMN_CARDS = (
-    "[class*='colBannerCard'], "
-    "[class*='ColumnBanner'] a[class*='Card'], "
-    "[class*='columnbanner' i] [class*='banner' i]"
-)
+# IMPORTANTE: los selectores se prueban EN ORDEN y se usa el PRIMERO que
+# devuelva resultados. No se pueden unir con coma.
+#
+# DOM real (build Vue, verificado 2026-08-27):
+#   bannerColumn-…__colBannerCardList___PU6em      <- contenedor de la lista
+#     bannerColumn-…__colBannerCard___LXHWt        <- LA TARJETA (x6)  ← esto queremos
+#       a.bannerColumn-…__colBannerCardContainer___U9eew  <- <a> interno con el href
+#
+# Los tres contienen la subcadena "colBannerCard", así que hay que excluir
+# explícitamente List y Container. Si no, se capturan nodos anidados de la
+# misma tarjeta y salen filas repetidas con la misma imagen.
+SEL_COLUMN_CANDIDATES = [
+    "[class*='colBannerCard']:not([class*='colBannerCardList']):not([class*='colBannerCardContainer'])",
+    "[class*='colBannerCardList'] > div",
+    "[class*='ColumnBanner'] a[class*='Card']",   # build React antiguo, por si vuelve
+]
 COLUMN_POSITIONS_GA = [1, 2, 3, 4, 5, 6]
 
 def _scroll_full(page, steps: int = 10, dy: int = 900):
@@ -587,37 +598,97 @@ def _scroll_full(page, steps: int = 10, dy: int = 900):
         page.wait_for_timeout(250)
     page.wait_for_timeout(800)
 
+def _dedupe_nested(nodes: list) -> list:
+    """
+    Descarta los nodos que estén CONTENIDOS dentro de otro nodo ya aceptado.
+    Red de seguridad por si un selector futuro vuelve a capturar padre e hijo.
+    """
+    kept = []
+    for n in nodes:
+        inside = False
+        for k in kept:
+            try:
+                if k.evaluate("(el, other) => el !== other && el.contains(other)", n):
+                    inside = True
+                    break
+            except Exception:
+                continue
+        if not inside:
+            kept.append(n)
+    return kept
+
+def _column_title(card) -> str:
+    """Título visible de la tarjeta (headingTitle en el build Vue)."""
+    for sel in ("[class*='headingTitle']", "[class*='heading___']", "[class*='title___']"):
+        try:
+            el = card.query_selector(sel)
+            if el:
+                t = (el.inner_text() or "").strip()
+                if t:
+                    return re.sub(r"\s+", " ", t)
+        except Exception:
+            continue
+    return ""
+
 def extract_column_banners(page, home_url: str, rows: List[Dict[str, str]]):
     item_lbl = "COLUMN BANNER"
-    slot = "ColumnBanner__colBannerCard__"
+    slot = "bannerColumn__colBannerCard___"
     if not safe_goto(page, home_url, "COLUMN BANNERS"):
         add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, "0", "Timeout cargando página", "", "", 0)
         return
     page.wait_for_timeout(WAIT_MS)
     _scroll_full(page)
-    try:
-        page.wait_for_selector(SEL_COLUMN_CARDS, timeout=8000)
-    except Exception:
-        pass
-    try:
-        cards = page.query_selector_all(SEL_COLUMN_CARDS) or []
-    except Exception:
-        cards = []
-    print(f"[COLUMN] {COUNTRY}: {len(cards)} tarjeta(s) encontradas.")
-    total = min(len(cards), len(COLUMN_POSITIONS_GA))
-    # Si no hay nada, dejamos constancia en el sheet (antes no se escribía
-    # ninguna fila y el fallo pasaba desapercibido durante días).
-    if total == 0:
-        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, "0",
-                "No se encontraron column banners (revisar selector)", "", "", 0)
-        return
-    for i in range(total):
-        card = cards[i]
+
+    # 1) Primer selector que devuelva algo
+    cards, used_sel = [], ""
+    for sel in SEL_COLUMN_CANDIDATES:
+        try:
+            page.wait_for_selector(sel, timeout=4000)
+        except Exception:
+            pass
+        try:
+            got = page.query_selector_all(sel) or []
+        except Exception:
+            got = []
+        if got:
+            cards, used_sel = got, sel
+            break
+    print(f"[COLUMN] {COUNTRY}: {len(cards)} nodo(s) con selector «{used_sel}»")
+
+    # 2) Red de seguridad: fuera los nodos anidados dentro de otra tarjeta
+    cards = _dedupe_nested(cards)
+
+    # 3) Extraer y deduplicar por (imagen, link) ANTES de cortar en 6
+    items: List[Tuple[str, str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for card in cards:
         target = card.query_selector("picture") or card.query_selector("img") or card
         img = _get_img_from_node(target, home_url)
         ln  = _get_link_from_node(card, home_url) or _get_link_from_node(target, home_url)
-        if img or ln:
-            add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, str(total), "", img, ln, i+1)
+        if not (img or ln):
+            continue
+        key = (img, ln)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append((img, ln, _column_title(card)))
+
+    print(f"[COLUMN] {COUNTRY}: {len(items)} banner(s) únicos tras deduplicar.")
+    if len(items) > len(COLUMN_POSITIONS_GA):
+        print(f"[COLUMN][WARN] {COUNTRY}: se encontraron {len(items)} banners pero "
+              f"solo hay {len(COLUMN_POSITIONS_GA)} slots GA4. Se recortan los últimos.")
+
+    # Si no hay nada, dejamos constancia en el sheet (antes no se escribía
+    # ninguna fila y el fallo pasaba desapercibido durante días).
+    if not items:
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, "0",
+                "No se encontraron column banners (revisar selector)", "", "", 0)
+        return
+
+    items = items[:len(COLUMN_POSITIONS_GA)]
+    total = len(items)
+    for i, (img, ln, title) in enumerate(items, start=1):
+        add_row(rows, COUNTRY, WEB_ASUS, item_lbl, slot, str(total), title, img, ln, i)
 # === END COLUMN BANNER FIX ===
 # 5) BANNER PROMOTIONAL ROG.com
 def extract_rog_promo_banner(page, home_url: str, rows: List[Dict[str, str]]):
